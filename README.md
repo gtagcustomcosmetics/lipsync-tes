@@ -1,1 +1,0 @@
-# lipsync-tes
