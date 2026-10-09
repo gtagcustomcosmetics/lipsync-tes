@@ -8,8 +8,8 @@
   html[data-bg="dark"], html[data-bg="dark"] body { background: #1b1f2a; }
   html[data-bg="green"], html[data-bg="green"] body { background: #00b140; }
   html[data-bg="transparent"], html[data-bg="transparent"] body { background: transparent; }
-  html, body { margin: 0; min-height: 100%; color: #eee; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
-  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 10px 0 24px; box-sizing: border-box; min-height: 100vh; }
+  html, body { margin: 0; min-height: 100%; color: #eee; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; overflow-y: auto; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 10px; padding: 10px 0 24px; box-sizing: border-box; min-height: 100vh; overflow-y: auto; }
   body.clean { padding: 0; }
 
   #stage { position: relative; height: min(62vh, 130vw); aspect-ratio: 660 / 1024; flex: none; }
@@ -34,6 +34,7 @@
   #msg { font-size: 14px; opacity: .75; min-height: 1.2em; text-align: center; padding: 0 12px; }
   .hint { font-size: 13px; opacity: .65; }
   details { width: 100%; background: rgba(0,0,0,.28); border-radius: 12px; padding: 8px 14px; box-sizing: border-box; }
+  details[open] { max-height: 70vh; overflow-y: auto; overscroll-behavior: contain; }
   summary { cursor: pointer; text-align: center; opacity: .9; font-size: 14px; }
   .panel { display: grid; gap: 10px; margin-top: 10px; }
   .panel h4 { margin: 6px 0 0; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; opacity: .6; font-weight: 600; }
