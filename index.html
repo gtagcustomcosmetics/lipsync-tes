@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sky Lean VR</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#7ec8ff;font-family:system-ui,sans-serif}
+  canvas{display:block}
+  #ui,#pause{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+      background:linear-gradient(#0d2b52cc,#1b5fa8cc);color:#fff;text-align:center;padding:20px}
+  h1{font-size:clamp(2.2rem,7vw,4.5rem);margin:0;letter-spacing:.02em}
+  p{max-width:34rem;margin:0;line-height:1.5;font-size:1.05rem}
+  button{font:inherit;font-weight:700;font-size:1.2rem;padding:14px 30px;border:0;border-radius:999px;cursor:pointer;
+         background:#ffd23f;color:#142a45;min-width:220px}
+  button.sel{background:#fff;outline:4px solid #ffd23f}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button:focus-visible{outline:3px solid #fff;outline-offset:3px}
+  small{opacity:.85}
+</style>
+</head>
+<body>
+<div id="ui">
+  <h1>Sky Lean VR</h1>
+  <p>Stay on the one-block path as it winds through the sky. <b>Lean</b> your head left or right to steer, <b>jump</b> over gaps, and <b>duck</b> under the floating red bars.</p>
+  <button id="pc">Play on PC</button>
+  <button id="vr" disabled>Enter VR</button>
+  <small id="note">A / D or ← → steer &nbsp;|&nbsp; W / ↑ / Space jump &nbsp;|&nbsp; S / ↓ / Shift duck &nbsp;|&nbsp; Esc / P pause (VR: B / Y button)</small>
+</div>
+
+<div id="pause" style="display:none">
+  <h1>Paused</h1>
+  <p>How do you want to turn?</p>
+  <button data-mode="lean">Lean head</button>
+  <button data-mode="joystick">Joystick</button>
+  <button data-mode="auto">Auto (follows track)</button>
+  <button id="resume">Resume</button>
+  <button id="restart">Restart</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const HALF = 0.5, STEP = 0.5, GRAVITY = 20, JUMP_V = 7.5, GAIN = 6;
+
+// ---------- scene ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x7ec8ff);
+scene.fog = new THREE.Fog(0x7ec8ff, 14, 55);
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 100);
+const rig = new THREE.Group();
+rig.add(camera); scene.add(rig);
+camera.position.set(0, 1.6, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.prepend(renderer.domElement);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x6f8fb8, 1));
+const sun = new THREE.DirectionalLight(0xffffff, 0.6); sun.position.set(3, 10, 5); scene.add(sun);
+
+const track = new THREE.Group(), sky = new THREE.Group();
+scene.add(track, sky);
+
+// distant floating decor
+const decorMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 });
+for (let i = 0; i < 40; i++) {
+  const c = new THREE.Mesh(new THREE.BoxGeometry(4 + Math.random() * 8, 1 + Math.random() * 1.5, 3 + Math.random() * 6), decorMat);
+  const a = Math.random() * 6.28, r = 25 + Math.random() * 25;
+  c.position.set(Math.cos(a) * r, -8 + Math.random() * 25, Math.sin(a) * r);
+  scene.add(c);
+}
+
+// ---------- HUD (attached to camera so it works in VR too) ----------
+const hc = document.createElement('canvas'); hc.width = 512; hc.height = 256;
+const hctx = hc.getContext('2d'), htex = new THREE.CanvasTexture(hc);
+const hud = new THREE.Mesh(new THREE.PlaneGeometry(1, 0.5),
+  new THREE.MeshBasicMaterial({ map: htex, transparent: true, depthTest: false, fog: false }));
+hud.position.set(0, 0.3, -1.4); hud.renderOrder = 999; camera.add(hud);
+let hudKey = '';
+function setHud(big, small) {
+  const key = big + '|' + small; if (key === hudKey) return; hudKey = key;
+  hctx.clearRect(0, 0, 512, 256); hctx.textAlign = 'center'; hctx.lineWidth = 8;
+  hctx.strokeStyle = '#0a2a4a'; hctx.fillStyle = '#fff';
+  hctx.font = 'bold 64px sans-serif'; hctx.strokeText(big, 256, 110); hctx.fillText(big, 256, 110);
+  hctx.font = 'bold 40px sans-serif'; hctx.strokeText(small, 256, 180); hctx.fillText(small, 256, 180);
+  htex.needsUpdate = true;
+}
+
+// ---------- path ----------
+const tileGeo = new THREE.BoxGeometry(1, 0.3, STEP * 1.02);
+const matA = new THREE.MeshStandardMaterial({ color: 0x2ec4b6 }), matB = new THREE.MeshStandardMaterial({ color: 0xff6b9d });
+const beamGeo = new THREE.BoxGeometry(3.4, 0.5, 0.4);
+const beamMat = new THREE.MeshStandardMaterial({ color: 0xe63946, emissive: 0x7a1020 });
+let pts, k, target, hold, gapLeft, lastObs, cleaned;
+
+function resetPath() {
+  track.clear(); sky.clear();
+  pts = [{ x: 0, z: 0, phi: 0, gap: false, beam: false }];
+  k = 0; target = 0; hold = 30; gapLeft = 0; lastObs = 0; cleaned = 0;
+  build(0);
+  for (let i = 0; i < 100; i++) addPoint();
+}
+function addPoint() {
+  const p = pts[pts.length - 1], i = pts.length;
+  if (--hold <= 0) { target = Math.random() < 0.25 ? 0 : (Math.random() * 2 - 1) * 0.17; hold = 8 + (Math.random() * 14 | 0); }
+  k += (target - k) * 0.2;
+  const n = { x: p.x - Math.sin(p.phi) * STEP, z: p.z - Math.cos(p.phi) * STEP, phi: p.phi + k * STEP, gap: false, beam: false };
+  if (i > 24) {
+    if (gapLeft > 0) { n.gap = true; gapLeft--; }
+    else if (i - lastObs > 16 && Math.random() < 0.12) {
+      lastObs = i;
+      if (Math.abs(k) < 0.06 && Math.random() < 0.55) { n.gap = true; gapLeft = 4; } // 5 points = 2.5 units
+      else n.beam = true;
+    }
+  }
+  pts.push(n); build(i);
+}
+function build(i) {
+  const n = pts[i];
+  if (!n.gap) {
+    const m = new THREE.Mesh(tileGeo, i % 2 ? matA : matB);
+    m.position.set(n.x, -0.15, n.z); m.rotation.y = n.phi; track.add(m); n.mesh = m;
+  }
+  if (n.beam) {
+    const b = new THREE.Mesh(beamGeo, beamMat);
+    b.position.set(n.x, 1.65, n.z); b.rotation.y = n.phi; sky.add(b); n.bm = b;
+  }
+}
+function segDist(a, b, x, z) {
+  const dx = b.x - a.x, dz = b.z - a.z;
+  const t = Math.max(0, Math.min(1, ((x - a.x) * dx + (z - a.z) * dz) / (dx * dx + dz * dz)));
+  return Math.hypot(a.x + dx * t - x, a.z + dz * t - z);
+}
+
+// ---------- input ----------
+const keys = { left: 0, right: 0, jump: 0, down: 0 };
+const map = { ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right', ArrowUp: 'jump', KeyW: 'jump', Space: 'jump', ArrowDown: 'down', KeyS: 'down', ShiftLeft: 'down', ShiftRight: 'down' };
+addEventListener('keydown', e => { if ((e.code === 'Escape' || e.code === 'KeyP') && !e.repeat) { state === 'paused' ? resume() : pause(); return; }
+  if (map[e.code]) { keys[map[e.code]] = 1; e.preventDefault(); } });
+addEventListener('keyup', e => { if (map[e.code]) keys[map[e.code]] = 0; });
+
+// ---------- game state ----------
+let state = 'menu', readyT = 0, deadT = 0, speed = 5, dist = 0, best = 0, vy = 0, falling = false, idx = 0;
+let wantJump = false, pcLean = 0, duckPC = 0, prevY = 1.6, base = { x: 0, y: 1.6 };
+
+function start() {
+  resetPath(); rig.position.set(0, 0, 0); rig.rotation.y = 0;
+  speed = 5; dist = 0; vy = 0; falling = false; idx = 0; wantJump = false;
+  state = 'ready'; readyT = renderer.xr.isPresenting ? 3 : 1;
+}
+function die(msg) {
+  if (state !== 'play') return;
+  state = 'dead'; deadT = 2.2; best = Math.max(best, dist | 0);
+  setHud(msg, (dist | 0) + ' m  (best ' + best + ')');
+}
+
+function update(dt) {
+  const xr = renderer.xr.isPresenting;
+  if (!xr) {
+    pcLean += ((keys.right - keys.left) * 0.3 - pcLean) * Math.min(1, dt * 10);
+    duckPC += (keys.down * 0.45 - duckPC) * Math.min(1, dt * 12);
+    camera.position.set(pcLean, 1.6 - duckPC, 0);
+    camera.rotation.set(-0.2, 0, -pcLean * 0.3);
+    base.x = 0; base.y = 1.6;
+  }
+  const joyX = xr ? pollPad() : keys.right - keys.left;
+  if (state === 'menu') return;
+  if (state === 'paused') { pauseFrame(); return; }
+
+  if (state === 'ready') {
+    setHud(xr ? 'Stand tall' : 'Get ready', xr ? 'Calibrating…' : '');
+    if ((readyT -= dt) <= 0) {
+      if (xr) { base.x = camera.position.x; base.y = camera.position.y; }
+      sky.position.y = base.y - 1.6; prevY = camera.position.y; state = 'play';
+    }
+    return;
+  }
+  if (state === 'dead') { if ((deadT -= dt) <= 0) start(); }
+
+  // jump input
+  const headY = camera.position.y, vHead = (headY - prevY) / dt; prevY = headY;
+  if (xr && vHead > 1.0 && headY - base.y > 0.03) wantJump = true;
+  if (keys.jump) wantJump = true;
+  const grounded = rig.position.y <= 0 && !falling;
+  if (state === 'play' && wantJump && grounded) vy = JUMP_V;
+  wantJump = false;
+
+  // steering from head lean
+  if (state === 'play' && !falling) {
+    if (turnMode === 'lean') {
+      let lean = camera.position.x - base.x;
+      lean = Math.abs(lean) < 0.03 ? 0 : lean - Math.sign(lean) * 0.03;
+      lean = Math.max(-0.35, Math.min(0.35, lean));
+      rig.rotation.y -= lean * GAIN * dt;
+    } else if (turnMode === 'joystick') {
+      rig.rotation.y -= (Math.abs(joyX) < 0.15 ? 0 : joyX) * 2.2 * dt;
+    } else { // auto: follow the track
+      const t = pts[Math.min(idx + 4, pts.length - 1)];
+      let df = Math.atan2(rig.position.x - t.x, rig.position.z - t.z) - rig.rotation.y;
+      df = Math.atan2(Math.sin(df), Math.cos(df));
+      rig.rotation.y += df * Math.min(1, dt * 8);
+    }
+  }
+
+  // move
+  if (state === 'play') speed = Math.min(9, 5 + dist / 150);
+  const f = rig.rotation.y;
+  if (state !== 'dead') {
+    rig.position.x -= Math.sin(f) * speed * dt; rig.position.z -= Math.cos(f) * speed * dt;
+    dist += speed * dt;
+  }
+  vy -= GRAVITY * dt; rig.position.y += vy * dt;
+  if (!falling && rig.position.y <= 0) { rig.position.y = 0; vy = 0; }
+
+  // locate on path
+  const d2 = i => (pts[i].x - rig.position.x) ** 2 + (pts[i].z - rig.position.z) ** 2;
+  while (idx < pts.length - 2 && d2(idx + 1) <= d2(idx)) idx++;
+  while (pts.length < idx + 100) addPoint();
+  while (cleaned < idx - 30) { const q = pts[cleaned++]; if (q.mesh) track.remove(q.mesh); if (q.bm) sky.remove(q.bm); }
+
+  if (state === 'play' && !falling) {
+    const d = Math.min(segDist(pts[idx], pts[idx + 1], rig.position.x, rig.position.z),
+                       idx > 0 ? segDist(pts[idx - 1], pts[idx], rig.position.x, rig.position.z) : 9);
+    if (d > HALF + 0.18 || (pts[idx].gap && rig.position.y <= 0.02 && vy <= 0)) falling = true;
+    const headRel = rig.position.y + camera.position.y - base.y;
+    for (let i = Math.max(0, idx - 1); i <= idx + 1; i++) {
+      const p = pts[i];
+      if (p.beam && Math.hypot(rig.position.x - p.x, rig.position.z - p.z) < 0.45 && headRel > -0.3) die('Bonk! Duck!');
+    }
+  }
+  if (falling && rig.position.y < -6) die('You fell!');
+  if (state === 'play') setHud((dist | 0) + ' m', 'best ' + best);
+}
+
+// ---------- pause menu & turn modes ----------
+let turnMode = 'lean', prevState = 'play', hover = -1;
+try { turnMode = localStorage.getItem('turnMode') || 'lean'; } catch (e) {}
+const pauseEl = document.getElementById('pause');
+const BTN = [
+  { id: 'lean', label: 'Lean head', y: 130, mode: 1 }, { id: 'joystick', label: 'Joystick', y: 215, mode: 1 },
+  { id: 'auto', label: 'Auto (follows track)', y: 300, mode: 1 },
+  { id: 'resume', label: 'Resume', y: 410 }, { id: 'restart', label: 'Restart', y: 495 }];
+const pcv = document.createElement('canvas'); pcv.width = 512; pcv.height = 600;
+const pctx = pcv.getContext('2d'), ptex = new THREE.CanvasTexture(pcv);
+const panel = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 1.055),
+  new THREE.MeshBasicMaterial({ map: ptex, transparent: true, depthTest: false, fog: false }));
+panel.renderOrder = 1000; panel.visible = false; scene.add(panel);
+function drawPanel() {
+  pctx.clearRect(0, 0, 512, 600); pctx.fillStyle = '#0d2b52ee'; pctx.fillRect(0, 0, 512, 600);
+  pctx.textAlign = 'center'; pctx.fillStyle = '#fff';
+  pctx.font = 'bold 54px sans-serif'; pctx.fillText('Paused', 256, 70);
+  pctx.font = '28px sans-serif'; pctx.fillText('Turning', 256, 112);
+  BTN.forEach((b, i) => {
+    const sel = b.mode && b.id === turnMode;
+    pctx.fillStyle = sel ? '#ffd23f' : (i === hover ? '#4a90d9' : '#2a5a96'); pctx.fillRect(40, b.y, 432, 70);
+    pctx.fillStyle = sel ? '#142a45' : '#fff'; pctx.font = 'bold 34px sans-serif'; pctx.fillText(b.label, 256, b.y + 46);
+  });
+  ptex.needsUpdate = true;
+}
+function setTurn(m) {
+  turnMode = m; try { localStorage.setItem('turnMode', m); } catch (e) {}
+  pauseEl.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('sel', b.dataset.mode === m));
+  drawPanel();
+}
+function pause() {
+  if (state !== 'play' && state !== 'ready') return;
+  prevState = state; state = 'paused'; hud.visible = false;
+  if (renderer.xr.isPresenting) {
+    const p = new THREE.Vector3(), d = new THREE.Vector3();
+    camera.getWorldPosition(p); camera.getWorldDirection(d); d.y = 0; d.normalize();
+    panel.position.copy(p).addScaledVector(d, 1.4); panel.position.y = p.y - 0.1;
+    panel.lookAt(p.x, panel.position.y, p.z); panel.visible = true;
+    lasers.forEach(l => l.visible = true); hover = -1; drawPanel();
+  } else pauseEl.style.display = 'flex';
+}
+function resume() {
+  state = prevState; hud.visible = true; panel.visible = false; pauseEl.style.display = 'none';
+  lasers.forEach(l => l.visible = false); prevY = camera.position.y; wantJump = false;
+}
+function menuAction(id) { if (id === 'resume') resume(); else if (id === 'restart') { resume(); start(); } else setTurn(id); }
+
+const ray = new THREE.Raycaster(), tm = new THREE.Matrix4(), lasers = [];
+function hitIndex(c) {
+  tm.identity().extractRotation(c.matrixWorld);
+  ray.ray.origin.setFromMatrixPosition(c.matrixWorld); ray.ray.direction.set(0, 0, -1).applyMatrix4(tm);
+  const h = ray.intersectObject(panel)[0]; if (!h) return -1;
+  const x = h.uv.x * 512, y = (1 - h.uv.y) * 600;
+  return BTN.findIndex(b => x >= 40 && x <= 472 && y >= b.y && y <= b.y + 70);
+}
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -4)]),
+    new THREE.LineBasicMaterial({ color: 0xffffff }));
+  l.visible = false; c.add(l); lasers.push(l);
+  c.addEventListener('selectstart', () => {
+    if (state === 'paused') { const h = hitIndex(c); if (h >= 0) menuAction(BTN[h].id); } else wantJump = true;
+  });
+  rig.add(c);
+}
+function pauseFrame() {
+  if (!renderer.xr.isPresenting) return;
+  let h = -1; lasers.forEach(l => { const q = hitIndex(l.parent); if (q >= 0) h = q; });
+  if (h !== hover) { hover = h; drawPanel(); }
+}
+const btnPrev = {};
+function pollPad() { // B / Y (or any extra menu button) toggles pause; thumbstick X returned for joystick turning
+  const s = renderer.xr.getSession(); let joy = 0; if (!s) return 0;
+  let i = 0;
+  for (const src of s.inputSources) {
+    const g = src.gamepad; i++; if (!g) continue;
+    let pressed = false; for (let b = 5; b < g.buttons.length; b++) if (g.buttons[b].pressed) pressed = true;
+    if (pressed && !btnPrev[i]) state === 'paused' ? resume() : pause();
+    btnPrev[i] = pressed;
+    const ax = g.axes.length >= 4 ? g.axes[2] : (g.axes[0] || 0); if (Math.abs(ax) > Math.abs(joy)) joy = ax;
+  }
+  return joy;
+}
+pauseEl.querySelectorAll('[data-mode]').forEach(b => b.onclick = () => setTurn(b.dataset.mode));
+document.getElementById('resume').onclick = () => resume();
+document.getElementById('restart').onclick = () => menuAction('restart');
+setTurn(turnMode);
+
+// ---------- UI / VR ----------
+const ui = document.getElementById('ui'), vrBtn = document.getElementById('vr');
+document.getElementById('pc').onclick = () => { ui.style.display = 'none'; start(); };
+if (navigator.xr) navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+  if (ok) vrBtn.disabled = false; else document.getElementById('note').textContent += '  (No VR headset detected, PC mode works)';
+});
+else document.getElementById('note').textContent += '  (WebXR not available in this browser, PC mode works)';
+vrBtn.onclick = async () => {
+  const s = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] });
+  renderer.xr.setReferenceSpaceType('local-floor');
+  await renderer.xr.setSession(s);
+  ui.style.display = 'none'; start();
+  s.addEventListener('end', () => { ui.style.display = 'flex'; state = 'menu'; panel.visible = false; pauseEl.style.display = 'none'; hud.visible = true; lasers.forEach(l => l.visible = false); camera.position.set(0, 1.6, 0); camera.quaternion.identity(); });
+};
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+resetPath();
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => { update(Math.min(clock.getDelta(), 0.05)); renderer.render(scene, camera); });
+</script>
+</body>
+</html>
